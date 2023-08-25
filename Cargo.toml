@@ -1,0 +1,15 @@
+[package]
+name = "fuse-experiments"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+postgres = "0.19.5"
+clap = { version = "3.0", features = ["cargo"] }
+daemonize = "0.5.0"
+env_logger = "0.9"
+fuser = "0.12.0"
+libc = "0.2.51"
+log = "0.4.6"
