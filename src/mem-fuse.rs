@@ -39,7 +39,7 @@ const CAPTURE_DIR_ATTR: FileAttr = FileAttr {
 };
 
 fn main() {
-    let matches = Command::new("PgLogCapture")
+    let matches = Command::new("mem-fuse")
         .version(crate_version!())
         .author("Mats Kindahl")
         .arg(

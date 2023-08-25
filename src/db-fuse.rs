@@ -39,7 +39,7 @@ const CAPTURE_DIR_ATTR: FileAttr = FileAttr {
 };
 
 fn main() {
-    let matches = Command::new("PgLogCapture")
+    let matches = Command::new("Database FUSE")
         .version(crate_version!())
         .author("Mats Kindahl")
         .arg(
@@ -146,14 +146,22 @@ fn new_attr(ino: i64, uid: u32, gid: u32, mode: u32) -> FileAttr {
 /**
  * Structure containing information captured by the file system.
  *
- * The lines will sent to the database as INSERT statements.
+ * The lines will sent to the database as INSERT statements and there
+ * is a set of function available that interfaces between the database
+ * and FUSE.
+ *
+ * The function in the database file system accepts FUSE types, but
+ * these needs to be translated to suitable database types for
+ * storage.
  */
 struct DatabaseFS {
     client: Client,
     entries: Option<Vec<postgres::Row>>,
     name_lookup: Statement,
-    inode_insert: Statement,
+    content_insert: Statement,
     inode_lookup: Statement,
+    inode_insert: Statement,
+    directory_scan: Statement,
 }
 
 impl Drop for DatabaseFS {
@@ -179,15 +187,22 @@ impl DatabaseFS {
         let entries = None;
         let name_lookup =
             client.prepare("SELECT ino, uid, gid, mode FROM inodes WHERE name = $1")?;
-        let inode_insert = client.prepare("INSERT INTO content(ino, line) VALUES ($1,$2)")?;
         let inode_lookup =
             client.prepare("SELECT ino, uid, gid, mode FROM inodes WHERE ino = $1")?;
+        let content_insert = client.prepare("INSERT INTO content(ino, line) VALUES ($1,$2)")?;
+        let inode_insert = client.prepare(
+            "INSERT INTO inodes(name, mode, uid, gid) VALUES ($1, $2, $3, $4) RETURNING ino",
+        )?;
+        let directory_scan = client.prepare("SELECT name, ino FROM inodes ORDER BY ino")?;
+
         Ok(DatabaseFS {
             client,
             entries,
             name_lookup,
-            inode_insert,
+            content_insert,
             inode_lookup,
+            inode_insert,
+            directory_scan,
         })
     }
 
@@ -232,15 +247,15 @@ impl DatabaseFS {
             let mode = mode as i32;
             let uid = uid as i32;
             let gid = gid as i32;
-            let row = self.client.query_one(
-                "INSERT INTO inodes(name, mode, uid, gid) VALUES ($1, $2, $3, $4) RETURNING ino",
-                &[&name, &mode, &uid, &gid],
-            )?;
+            let row = self
+                .client
+                .query_one(&self.inode_insert, &[&name, &mode, &uid, &gid])?;
             row.get("ino")
         };
-        Ok(new_attr(ino as i64, uid as u32, gid as u32, mode as u32))
+        Ok(new_attr(ino as i64, uid, gid, mode))
     }
 
+    // Data is split up into lines and written to the content table.
     fn write_inode(&mut self, ino: i32, data: &[u8]) -> Result<(), postgres::Error> {
         let ino = ino as i32;
         let lines: Result<Vec<_>, Utf8Error> = data
@@ -254,7 +269,7 @@ impl DatabaseFS {
             })
             .collect();
         for line in lines.unwrap() {
-            self.client.execute(&self.inode_insert, &[&ino, &line])?;
+            self.client.execute(&self.content_insert, &[&ino, &line])?;
         }
         Ok(())
     }
@@ -267,11 +282,6 @@ impl Filesystem for DatabaseFS {
 
     /// Look up the name and return the attributes.
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_str = name.to_str().unwrap();
-        debug!(
-            "lookup() called with parent={:?} name={:?}",
-            parent, name_str
-        );
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG);
             return;
@@ -288,15 +298,9 @@ impl Filesystem for DatabaseFS {
         }
     }
 
-    fn forget(&mut self, _req: &Request, inode: u64, nlookup: u64) {
-        debug!(
-            "forget() called with inode={:?} nlookup={:?}",
-            inode, nlookup
-        );
-    }
+    fn forget(&mut self, _req: &Request, _inode: u64, _nlookup: u64) {}
 
     fn getattr(&mut self, _req: &Request, inode: u64, reply: ReplyAttr) {
-        debug!("getattr() called with inode={:?}", inode);
         if inode == FUSE_ROOT_ID {
             reply.attr(&ZERO, &CAPTURE_DIR_ATTR);
         } else if let Ok(attrs) = self.get_inode(inode) {
@@ -411,9 +415,7 @@ impl Filesystem for DatabaseFS {
             return;
         }
 
-        let result = self
-            .client
-            .query("SELECT name, ino FROM inodes ORDER BY ino", &[]);
+        let result = self.client.query(&self.directory_scan, &[]);
 
         match result {
             Ok(files) => {
@@ -445,7 +447,7 @@ impl Filesystem for DatabaseFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        debug!("readdir() called with {:?}", inode);
+        debug!("readdir() called with fh={} ino={}", fh, inode);
 
         // We only allow reading the top directory
         if fh != 42 {
@@ -480,7 +482,6 @@ impl Filesystem for DatabaseFS {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        debug!("create() called with {:?} {:?}", parent, name);
         if parent != FUSE_ROOT_ID {
             reply.error(libc::EBADFD);
         } else if let Ok(_) = self.lookup_name(name.to_str().unwrap()) {
@@ -488,7 +489,6 @@ impl Filesystem for DatabaseFS {
         } else {
             match self.allocate_inode(name.to_str().unwrap(), req.uid(), req.gid(), mode) {
                 Ok(attrs) => {
-                    debug!("allocated inode {:?}", attrs);
                     reply.created(&ZERO, &attrs, 0, 0, 0);
                 }
                 Err(err) => {
@@ -511,11 +511,6 @@ impl Filesystem for DatabaseFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        debug!(
-            "write() called with inode={:?} size={:?}",
-            inode,
-            data.len()
-        );
         match self.write_inode(inode as i32, data) {
             Ok(_) => reply.written(data.len() as u32),
             Err(err) => {
