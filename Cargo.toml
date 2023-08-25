@@ -17,3 +17,8 @@ log = "0.4.6"
 [[bin]]
 name = "mem-fuse"
 path = "src/mem-fuse.rs"
+
+[[bin]]
+name = "db-fuse"
+path = "src/db-fuse.rs"
+
